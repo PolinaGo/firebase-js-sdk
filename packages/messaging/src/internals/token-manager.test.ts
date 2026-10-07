@@ -123,12 +123,18 @@ describe('Token Manager', () => {
       expect(firstToken).to.equal('token-value');
       expect(requestGetTokenStub).to.have.been.calledOnce;
 
+      const unsubscribeSpy = spy(
+        (await messaging.swRegistration!.pushManager.getSubscription())!,
+        'unsubscribe'
+      );
+
       await unregister(messaging);
 
       expect(requestDeleteRegistrationStub).to.have.been.calledOnceWith(
         messaging.firebaseDependencies,
         'FID'
       );
+      expect(unsubscribeSpy).to.have.been.calledOnce;
 
       const secondToken = await getTokenInternal(messaging);
 

@@ -18,13 +18,15 @@
 import '../testing/setup';
 
 import { expect } from 'chai';
-import { stub } from 'sinon';
+import { SinonStub, spy, stub } from 'sinon';
 import { MessagingService } from '../messaging-service';
 import {
   getFakeAnalyticsProvider,
   getFakeApp,
   getFakeInstallations
 } from '../testing/fakes/firebase-dependencies';
+import { FakeServiceWorkerRegistration } from '../testing/fakes/service-worker';
+import { Stub } from '../testing/sinon-types';
 import { unregister } from './unregister';
 import * as idbManager from '../internals/idb-manager';
 import * as requestsModule from '../internals/requests';
@@ -166,5 +168,91 @@ describe('unregister', () => {
     await expect(unregister(messaging)).to.be.rejectedWith('boom');
     expect(onUnregisteredSpy).to.not.have.been.called;
     expect(dbRemoveStub).to.not.have.been.called;
+  });
+
+  describe('push subscription', () => {
+    let swRegistration: FakeServiceWorkerRegistration;
+    let onUnregisteredSpy: SinonStub;
+    let deleteRegStub: Stub<
+      (typeof requestsModule)['requestDeleteRegistration']
+    >;
+
+    beforeEach(() => {
+      swRegistration = new FakeServiceWorkerRegistration();
+      messaging.swRegistration = swRegistration;
+      onUnregisteredSpy = stub();
+      messaging.onUnregisteredHandler = onUnregisteredSpy;
+
+      stub(idbManager, 'dbGetFidRegistration').resolves({
+        fid: 'FID',
+        lastRegisterTime: Date.now()
+      });
+      stub(idbManager, 'dbRemoveFidRegistration').resolves();
+      deleteRegStub = stub(
+        requestsModule,
+        'requestDeleteRegistration'
+      ).resolves();
+    });
+
+    it('unsubscribes the push subscription after deleting the registration', async () => {
+      const subscription = await swRegistration.pushManager.subscribe();
+      const unsubscribeSpy = spy(subscription, 'unsubscribe');
+
+      await unregister(messaging);
+
+      expect(unsubscribeSpy).to.have.been.calledOnce;
+      expect(unsubscribeSpy).to.have.been.calledAfter(deleteRegStub);
+      expect(unsubscribeSpy).to.have.been.calledBefore(onUnregisteredSpy);
+      expect(onUnregisteredSpy).to.have.been.calledOnceWith('FID');
+    });
+
+    it('does not unsubscribe the push subscription when deleting the registration fails', async () => {
+      const subscription = await swRegistration.pushManager.subscribe();
+      const unsubscribeSpy = spy(subscription, 'unsubscribe');
+      deleteRegStub.rejects(new Error('boom'));
+
+      await expect(unregister(messaging)).to.be.rejectedWith('boom');
+
+      expect(unsubscribeSpy).to.not.have.been.called;
+      expect(onUnregisteredSpy).to.not.have.been.called;
+    });
+
+    it('still resolves and notifies onUnregistered when unsubscribing fails', async () => {
+      const subscription = await swRegistration.pushManager.subscribe();
+      const unsubscribeStub = stub(subscription, 'unsubscribe').rejects(
+        new Error('unsubscribe failed')
+      );
+
+      await unregister(messaging);
+
+      expect(unsubscribeStub).to.have.been.calledOnce;
+      expect(onUnregisteredSpy).to.have.been.calledOnceWith('FID');
+    });
+
+    it('resolves and notifies onUnregistered when there is no push subscription', async () => {
+      const getSubscriptionSpy = spy(
+        swRegistration.pushManager,
+        'getSubscription'
+      );
+
+      await unregister(messaging);
+
+      expect(getSubscriptionSpy).to.have.been.calledOnce;
+      expect(onUnregisteredSpy).to.have.been.calledOnceWith('FID');
+    });
+
+    it('resolves and notifies onUnregistered when no service worker registration is known to the instance', async () => {
+      messaging.swRegistration = undefined;
+
+      await unregister(messaging);
+
+      expect(deleteRegStub).to.have.been.calledOnceWith(
+        messaging.firebaseDependencies,
+        'FID'
+      );
+      expect(onUnregisteredSpy).to.have.been.calledOnceWith('FID');
+      // unregister() must not look up or register a service worker on its own.
+      expect(messaging.swRegistration).to.be.undefined;
+    });
   });
 });
