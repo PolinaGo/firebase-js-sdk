@@ -33,19 +33,22 @@ const FID_REGISTRATION_FID_MATCH_MAX_ATTEMPTS = 3;
  *   `projects/{projectId}/registrations/{fid}`); it must match `expectedFid` from
  *   Installations.getId(). On mismatch we refresh the auth token and retry, then fail with
  *   `fid-registration-failed`.
+ * - The push subscription and the registration both use `vapidKey`, which defaults to
+ *   `messaging.vapidKey`. Callers that persist the registered key should pass it explicitly.
  */
 export async function registerFcmRegistrationWithFid(
   messaging: MessagingService,
-  expectedFid: string
+  expectedFid: string,
+  vapidKey: string = messaging.vapidKey!
 ): Promise<void> {
-  const pushSubscription = await getPushSubscription(
-    messaging.swRegistration!,
-    messaging.vapidKey!
-  );
+  // Read the instance state before the first await, so that a concurrent change cannot make the
+  // push subscription and the registration disagree.
+  const swRegistration = messaging.swRegistration!;
+  const pushSubscription = await getPushSubscription(swRegistration, vapidKey);
 
   const subscriptionOptions: SubscriptionOptions = {
-    vapidKey: messaging.vapidKey!,
-    swScope: messaging.swRegistration!.scope,
+    vapidKey,
+    swScope: swRegistration.scope,
     endpoint: pushSubscription.endpoint,
     auth: arrayToBase64(pushSubscription.getKey('auth')!),
     p256dh: arrayToBase64(pushSubscription.getKey('p256dh')!)

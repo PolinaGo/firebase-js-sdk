@@ -36,7 +36,8 @@ const FID_REGISTRATION_REFRESH_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
  * previously associated with this instance. The backend send API supports FID as a target.
  *
  * When called multiple times, `onRegistered` is invoked on each call with the current FID.
- * Backend registration sync runs on first register, when the FID changes, or on weekly refresh.
+ * Backend registration sync runs on first register, when the FID or VAPID key changes, or on
+ * weekly refresh.
  *
  * @param messaging - The MessagingService instance.
  * @param options - Optional. Same options as getToken (vapidKey, serviceWorkerRegistration).
@@ -67,6 +68,9 @@ export async function register(
   // Keep the queue alive after a failed register() so future calls can retry.
   const prev = messaging._registerNotifyChain.catch(() => {});
   messaging._registerNotifyChain = prev.then(async () => {
+    // Snapshot the VAPID key: a concurrent register() call may change `messaging.vapidKey` while
+    // this task is in flight, and the key persisted below must be the one that was registered.
+    const vapidKey = messaging.vapidKey!;
     const fid = await messaging.firebaseDependencies.installations.getId();
 
     const stored = await dbGetFidRegistration(messaging.firebaseDependencies);
@@ -74,14 +78,16 @@ export async function register(
     const shouldRefresh =
       !stored ||
       stored.fid !== fid ||
+      // Also true for metadata written before the VAPID key was persisted.
+      stored.vapidKey !== vapidKey ||
       now >= stored.lastRegisterTime + FID_REGISTRATION_REFRESH_MS;
 
     if (shouldRefresh) {
-      await registerFcmRegistrationWithFid(messaging, fid);
+      await registerFcmRegistrationWithFid(messaging, fid, vapidKey);
       await dbSetFidRegistration(messaging.firebaseDependencies, {
         fid,
         lastRegisterTime: now,
-        vapidKey: messaging.vapidKey
+        vapidKey
       });
     }
 

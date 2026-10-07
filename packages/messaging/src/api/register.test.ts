@@ -20,7 +20,11 @@ import '../testing/setup';
 import { deleteToken } from './deleteToken';
 import { getToken } from './getToken';
 import { register } from './register';
-import { dbGet, dbGetFidRegistration } from '../internals/idb-manager';
+import {
+  dbGet,
+  dbGetFidRegistration,
+  dbSetFidRegistration
+} from '../internals/idb-manager';
 import * as idbManager from '../internals/idb-manager';
 import { MessagingService } from '../messaging-service';
 import {
@@ -29,12 +33,18 @@ import {
   getFakeInstallations
 } from '../testing/fakes/firebase-dependencies';
 import { FakeServiceWorkerRegistration } from '../testing/fakes/service-worker';
-import { stub, useFakeTimers } from 'sinon';
+import { spy, stub, useFakeTimers } from 'sinon';
 import { expect } from 'chai';
+import { base64ToArray } from '../helpers/array-base64-translator';
 import * as updateVapidKeyModule from '../helpers/updateVapidKey';
 import * as updateSwRegModule from '../helpers/updateSwReg';
 import { Stub } from '../testing/sinon-types';
 import * as requestsModule from '../internals/requests';
+
+/** The VAPID key set on the messaging instance in `beforeEach`. */
+const VAPID_KEY_A = 'dmFwaWQta2V5LXZhbHVl';
+const VAPID_KEY_B =
+  'BFsgEwl8eIQ30RpOPT7-o2x_ojOaPcSoJUBx-vWKT7xYvUTdq3j11Dm9hctS75bJ9LKx2KJW2j8Q0wZnuUS8yVQ';
 
 function makeSwRegistration(): ServiceWorkerRegistration {
   return new FakeServiceWorkerRegistration() as unknown as ServiceWorkerRegistration;
@@ -471,5 +481,128 @@ describe('register', () => {
     expect(onRegisteredSpy).to.have.been.calledThrice;
     expect(onRegisteredSpy.getCall(2)).to.have.been.calledWith('FID_B');
     expect(requestCreateRegistrationStub).to.have.been.calledTwice;
+  });
+
+  describe('when the VAPID key changes', () => {
+    beforeEach(() => {
+      // Let `options.vapidKey` update the instance, like the real updateVapidKey().
+      updateVapidKeyStub.callsFake(async (msg, key) => {
+        if (key) {
+          msg.vapidKey = key;
+        }
+      });
+    });
+
+    it('re-registers with the backend when the VAPID key changes within the refresh window', async () => {
+      const onRegisteredSpy = stub();
+      messaging.onRegisteredHandler = onRegisteredSpy;
+
+      await register(messaging, { vapidKey: VAPID_KEY_A });
+      await register(messaging, { vapidKey: VAPID_KEY_B });
+
+      expect(requestCreateRegistrationStub).to.have.been.calledTwice;
+      expect(requestCreateRegistrationStub.firstCall.args[1].vapidKey).to.equal(
+        VAPID_KEY_A
+      );
+      expect(
+        requestCreateRegistrationStub.secondCall.args[1].vapidKey
+      ).to.equal(VAPID_KEY_B);
+      expect(
+        (await dbGetFidRegistration(messaging.firebaseDependencies))?.vapidKey
+      ).to.equal(VAPID_KEY_B);
+      expect(onRegisteredSpy).to.have.been.calledTwice;
+      expect(onRegisteredSpy.getCall(1)).to.have.been.calledWith('FID');
+      expect(requestDeleteRegistrationStub).to.not.have.been.called;
+    });
+
+    it('does not re-register when the same VAPID key is passed again within the refresh window', async () => {
+      const onRegisteredSpy = stub();
+      messaging.onRegisteredHandler = onRegisteredSpy;
+
+      await register(messaging, { vapidKey: VAPID_KEY_B });
+      await register(messaging, { vapidKey: VAPID_KEY_B });
+
+      expect(requestCreateRegistrationStub).to.have.been.calledOnce;
+      expect(onRegisteredSpy).to.have.been.calledTwice;
+    });
+
+    it('re-registers when stored FID metadata has no VAPID key (written by an older SDK)', async () => {
+      const onRegisteredSpy = stub();
+      messaging.onRegisteredHandler = onRegisteredSpy;
+      await dbSetFidRegistration(messaging.firebaseDependencies, {
+        fid: 'FID',
+        lastRegisterTime: Date.now()
+      });
+
+      await register(messaging);
+
+      expect(requestCreateRegistrationStub).to.have.been.calledOnce;
+      expect(requestCreateRegistrationStub.firstCall.args[1].vapidKey).to.equal(
+        VAPID_KEY_A
+      );
+      expect(
+        (await dbGetFidRegistration(messaging.firebaseDependencies))?.vapidKey
+      ).to.equal(VAPID_KEY_A);
+      expect(onRegisteredSpy).to.have.been.calledOnceWith('FID');
+    });
+
+    it('re-subscribes push with the new VAPID key when the key changes', async () => {
+      messaging.onRegisteredHandler = stub();
+      await register(messaging, { vapidKey: VAPID_KEY_A });
+
+      const pushManager = messaging.swRegistration!.pushManager;
+      const unsubscribeSpy = spy(
+        (await pushManager.getSubscription())!,
+        'unsubscribe'
+      );
+      const subscribeSpy = spy(pushManager, 'subscribe');
+
+      await register(messaging, { vapidKey: VAPID_KEY_B });
+
+      expect(unsubscribeSpy).to.have.been.calledOnce;
+      expect(subscribeSpy).to.have.been.calledOnce;
+      expect(
+        subscribeSpy.firstCall.args[0]?.applicationServerKey
+      ).to.deep.equal(base64ToArray(VAPID_KEY_B));
+      expect(requestCreateRegistrationStub).to.have.been.calledTwice;
+      expect(
+        requestCreateRegistrationStub.secondCall.args[1].vapidKey
+      ).to.equal(VAPID_KEY_B);
+    });
+
+    it('persists the VAPID key that was actually registered when a concurrent register() changes it', async () => {
+      messaging.onRegisteredHandler = stub();
+      let markFirstCallStarted!: () => void;
+      const firstCallStarted = new Promise<void>(resolve => {
+        markFirstCallStarted = resolve;
+      });
+      let resolveFirstCall!: (
+        result: requestsModule.CreateRegistrationResult
+      ) => void;
+      requestCreateRegistrationStub.onFirstCall().callsFake(() => {
+        markFirstCallStarted();
+        return new Promise<requestsModule.CreateRegistrationResult>(resolve => {
+          resolveFirstCall = resolve;
+        });
+      });
+
+      const firstRegister = register(messaging, { vapidKey: VAPID_KEY_A });
+      // Wait until the first register() is in flight with key A, then change the key.
+      await firstCallStarted;
+      const secondRegister = register(messaging, { vapidKey: VAPID_KEY_B });
+      resolveFirstCall({ responseFid: 'FID' });
+      await Promise.all([firstRegister, secondRegister]);
+
+      expect(requestCreateRegistrationStub).to.have.been.calledTwice;
+      expect(requestCreateRegistrationStub.firstCall.args[1].vapidKey).to.equal(
+        VAPID_KEY_A
+      );
+      expect(
+        requestCreateRegistrationStub.secondCall.args[1].vapidKey
+      ).to.equal(VAPID_KEY_B);
+      expect(
+        (await dbGetFidRegistration(messaging.firebaseDependencies))?.vapidKey
+      ).to.equal(VAPID_KEY_B);
+    });
   });
 });
